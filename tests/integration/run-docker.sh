@@ -61,15 +61,34 @@ function setOperatingSystemAbstractionVariables() {
 			fi
 
 			MKTEMP=gmktemp
+			TIMEOUT=gtimeout
 			;;
 		linux*)
 			MKTEMP=mktemp
+			TIMEOUT=timeout
 			;;
 		*)
 			echo "Operating system ($OSTYPE) not supported"
 			exit 1
 			;;
 	esac
+}
+
+function prepareDatabase() {
+	DATABASE_HOST=mysql
+
+	DATABASE_CONTAINER=database-nextcloud-local-test-integration-spreed
+
+	echo "Starting Selenium server"
+	docker run --detach --name=$DATABASE_CONTAINER --env "MYSQL_ROOT_PASSWORD=nextcloud" --env "MYSQL_USER=oc_autotest" --env "MYSQL_PASSWORD=nextcloud" --env "MYSQL_DATABASE=oc_autotest" mysql:5.7
+
+	DATABASE_IP=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $DATABASE_CONTAINER)
+
+	echo "Waiting for database server to be ready"
+	if ! $TIMEOUT 600s bash -c "while ! curl $DATABASE_IP:3306 >/dev/null 2>&1; do sleep 1; done"; then
+		echo "Could not start database server after 600 seconds" >&2
+		exit 1
+	fi
 }
 
 # Creates a Docker container to run the integration tests.
@@ -86,7 +105,7 @@ function prepareDocker() {
 	echo "Starting the Nextcloud container"
 	# When using "nextcloudci/phpX.Y" images the container exits immediately if
 	# no command is given, so a Bash session is created to prevent that.
-	docker run --detach --name=$NEXTCLOUD_LOCAL_CONTAINER --interactive --tty $NEXTCLOUD_LOCAL_IMAGE bash
+	docker run --detach --name=$NEXTCLOUD_LOCAL_CONTAINER --network=container:$DATABASE_CONTAINER --interactive --tty $NEXTCLOUD_LOCAL_IMAGE bash
 
 	# Use the $TMPDIR or, if not set, fall back to /tmp.
 	NEXTCLOUD_LOCAL_TAR="$($MKTEMP --tmpdir="${TMPDIR:-/tmp}" --suffix=.tar nextcloud-local-XXXXXXXXXX)"
@@ -101,7 +120,8 @@ function prepareDocker() {
 	docker cp - $NEXTCLOUD_LOCAL_CONTAINER:/nextcloud/ < "$NEXTCLOUD_LOCAL_TAR"
 
 	echo "Installing Nextcloud in the container"
-	docker exec $NEXTCLOUD_LOCAL_CONTAINER bash -c "cd nextcloud && php occ maintenance:install --admin-pass=admin"
+	# TODO use variables
+	docker exec $NEXTCLOUD_LOCAL_CONTAINER bash -c "cd nextcloud && php occ maintenance:install --admin-pass=admin --database=mysql --database-name=oc_autotest --database-host=127.0.0.1 --database-user=oc_autotest --database-pass=nextcloud"
 }
 
 # Removes/stops temporal elements created/started by this script.
@@ -123,6 +143,11 @@ function cleanUp() {
 	if [ -n "$(docker ps --all --quiet --filter name="^/$NEXTCLOUD_LOCAL_CONTAINER$")" ]; then
 		echo "Removing Docker container $NEXTCLOUD_LOCAL_CONTAINER"
 		docker rm --volumes --force $NEXTCLOUD_LOCAL_CONTAINER
+	fi
+
+	if [ -n "$DATABASE_CONTAINER" -a -n "$(docker ps --all --quiet --filter name="^/$DATABASE_CONTAINER$")" ]; then
+		echo "Removing Docker container $DATABASE_CONTAINER"
+		docker rm --volumes --force $DATABASE_CONTAINER
 	fi
 }
 
@@ -150,6 +175,7 @@ SCENARIO_TO_RUN=$1
 
 setOperatingSystemAbstractionVariables
 
+prepareDatabase
 prepareDocker
 
 echo "Running tests"
